@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "844935811302",
+    "project_id": "litteray-renew",
+    "storage_bucket": "litteray-renew.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:844935811302:android:bfd5a5c725439687bceb27",
+        "android_client_info": {
+          "package_name": "com.example.litteray"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBI0GvsSffVaLWJBMAvi6o3UjDEEI8eRtI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
