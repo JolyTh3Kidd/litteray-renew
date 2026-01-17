@@ -11,6 +11,7 @@
         "cloud_firestore",
         "firebase_auth",
         "firebase_core",
+        "firebase_messaging",
         "flutter",
         "flutter_local_notifications",
         "image_picker",
@@ -98,6 +99,18 @@
         "url_launcher_platform_interface",
         "url_launcher_web",
         "url_launcher_windows"
+      ]
+    },
+    {
+      "name": "firebase_messaging",
+      "version": "16.1.0",
+      "dependencies": [
+        "firebase_core",
+        "firebase_core_platform_interface",
+        "firebase_messaging_platform_interface",
+        "firebase_messaging_web",
+        "flutter",
+        "meta"
       ]
     },
     {
@@ -414,6 +427,31 @@
       "dependencies": [
         "flutter",
         "url_launcher_platform_interface"
+      ]
+    },
+    {
+      "name": "firebase_messaging_web",
+      "version": "4.1.1",
+      "dependencies": [
+        "_flutterfire_internals",
+        "firebase_core",
+        "firebase_core_web",
+        "firebase_messaging_platform_interface",
+        "flutter",
+        "flutter_web_plugins",
+        "meta",
+        "web"
+      ]
+    },
+    {
+      "name": "firebase_messaging_platform_interface",
+      "version": "4.7.5",
+      "dependencies": [
+        "_flutterfire_internals",
+        "firebase_core",
+        "flutter",
+        "meta",
+        "plugin_platform_interface"
       ]
     },
     {

@@ -14,7 +14,6 @@ class OtherUserProfilePage extends StatelessWidget {
     return Scaffold(
       backgroundColor: const Color(0xFF101216), 
       appBar: AppBar(
-        title: const Text("Profile"),
         centerTitle: true,
         backgroundColor: const Color(0xFF101216),
         elevation: 0,

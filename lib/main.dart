@@ -23,8 +23,101 @@ void main() async {
   runApp(const MessengerApp());
 }
 
-class MessengerApp extends StatelessWidget {
+class MessengerApp extends StatefulWidget {
   const MessengerApp({super.key});
+
+  @override
+  State<MessengerApp> createState() => _MessengerAppState();
+}
+
+class _MessengerAppState extends State<MessengerApp> with WidgetsBindingObserver {
+  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
+  StreamSubscription? _globalMsgSubscription;
+  AppLifecycleState _appState = AppLifecycleState.resumed;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initNotifications();
+    _startGlobalListener();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _globalMsgSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appState = state;
+  }
+
+  void _initNotifications() async {
+    const AndroidInitializationSettings androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher'); 
+    const InitializationSettings settings = InitializationSettings(android: androidSettings);
+    await _notificationsPlugin.initialize(settings);
+    _notificationsPlugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();
+  }
+
+  void _startGlobalListener() {
+    FirebaseAuth.instance.authStateChanges().listen((user) {
+      _globalMsgSubscription?.cancel();
+      if (user != null) {
+        try {
+          _globalMsgSubscription = FirebaseFirestore.instance
+              .collectionGroup('messages')
+              .where('receiverId', isEqualTo: user.uid)
+              .orderBy('timestamp', descending: true)
+              .limit(1)
+              .snapshots()
+              .listen((snapshot) {
+            
+            if (snapshot.docs.isNotEmpty) {
+              for (var change in snapshot.docChanges) {
+                if (change.type == DocumentChangeType.added) {
+                  var data = change.doc.data() as Map<String, dynamic>;
+                  Timestamp? ts = data['timestamp'];
+                  if (ts != null) {
+                    final now = DateTime.now();
+                    final msgTime = ts.toDate();
+                    if (now.difference(msgTime).inSeconds < 30) {
+                       if (_appState != AppLifecycleState.resumed) {
+                         _showNotification(data['message'] ?? "New Message");
+                       }
+                    }
+                  }
+                }
+              }
+            }
+          }, onError: (error) {
+            debugPrint("Global Listener Error (Likely missing index): $error");
+          });
+        } catch (e) {
+          debugPrint("Error initializing global listener: $e");
+        }
+      }
+    });
+  }
+
+  void _showNotification(String message) async {
+    const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+      'chat_channel_id', 'Messages', importance: Importance.max, priority: Priority.high, playSound: true,
+    );
+    const NotificationDetails details = NotificationDetails(android: androidDetails);
+    
+    String content = message;
+    if (content.length > 100 && !content.contains(" ")) content = "📷 Photo";
+    
+    await _notificationsPlugin.show(
+      DateTime.now().millisecond, 
+      "New Message", 
+      content, 
+      details
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -47,21 +140,28 @@ class MessengerApp extends StatelessWidget {
 class ChatScreen extends StatefulWidget {
   final String receiverUserID;
   final String receiverName;
-  const ChatScreen({super.key, required this.receiverUserID, required this.receiverName});
+  final bool isGroup;
+  final String? roomId;
+
+  const ChatScreen({
+    super.key, 
+    required this.receiverUserID, 
+    required this.receiverName,
+    this.isGroup = false,
+    this.roomId
+  });
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _msgController = TextEditingController();
   final AudioRecorder _recorder = AudioRecorder();
   final ScrollController _scrollController = ScrollController();
-  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
 
   Timer? _typingTimer;
   bool _isRec = false;
-  // --- NEW: Mute State ---
   bool _isMuted = false;
 
   String? _editingMsgId;
@@ -72,8 +172,6 @@ class _ChatScreenState extends State<ChatScreen> {
   int _limit = 30;
   final int _limitIncrement = 20;
   
-  StreamSubscription? _msgSubscription;
-  // --- NEW: Room Subscription for Mute Status ---
   StreamSubscription? _roomSubscription;
   
   final Map<String, GlobalKey> _messageKeys = {};
@@ -81,10 +179,10 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _setUserStatus(true);
     _markAsRead();
-    _initNotifications();
-    _listenForNewMessages();
-    _listenForRoomChanges(); // Start listening for mute status
+    _listenForRoomChanges();
     
     _scrollController.addListener(() {
       if (_scrollController.hasClients && 
@@ -94,14 +192,37 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  void _initNotifications() async {
-    const AndroidInitializationSettings androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher'); 
-    const InitializationSettings settings = InitializationSettings(android: androidSettings);
-    await _notificationsPlugin.initialize(settings);
-    _notificationsPlugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _setUserStatus(false);
+    _roomSubscription?.cancel();
+    _msgController.dispose();
+    _recorder.dispose();
+    _scrollController.dispose();
+    _typingTimer?.cancel();
+    super.dispose();
   }
 
-  // --- NEW: Listen to Room Doc for Mute Status ---
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _setUserStatus(true);
+    } else {
+      _setUserStatus(false);
+    }
+  }
+
+  void _setUserStatus(bool isOnline) {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid != null) {
+      FirebaseFirestore.instance.collection('users').doc(uid).update({
+        'isOnline': isOnline,
+        'lastActive': Timestamp.now(),
+      });
+    }
+  }
+
   void _listenForRoomChanges() {
     _roomSubscription = FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).snapshots().listen((snapshot) {
       if (snapshot.exists) {
@@ -116,36 +237,57 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  void _listenForNewMessages() {
-    _msgSubscription = FirebaseFirestore.instance
-        .collection('chat_rooms').doc(_getRoomId()).collection('messages')
-        .orderBy('timestamp', descending: true).limit(1).snapshots().listen((snapshot) {
-      if (snapshot.docs.isNotEmpty) {
-        for (var change in snapshot.docChanges) {
-          if (change.type == DocumentChangeType.added) {
-            var data = change.doc.data() as Map<String, dynamic>;
-            if (data['senderId'] == widget.receiverUserID) {
-               // --- CHANGED: Check mute status before notifying ---
-               if (!_isMuted) {
-                 _showNotification(data['message']);
-               }
-            }
-          }
-        }
-      }
-    });
+  void _updateGroupPic() async {
+    final picker = ImagePicker();
+    final image = await picker.pickImage(source: ImageSource.gallery, imageQuality: 20);
+    if (image != null) {
+      final bytes = await image.readAsBytes();
+      final base64String = base64Encode(bytes);
+      await FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).update({
+        'groupPic': base64String
+      });
+    }
   }
 
-  void _showNotification(String message) async {
-    const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
-      'chat_channel_id', 'Messages', importance: Importance.max, priority: Priority.high, playSound: true,
-    );
-    const NotificationDetails details = NotificationDetails(android: androidDetails);
-    
-    String content = message;
-    if (content.length > 100 && _isBase64(content)) content = "📷 Photo";
-    
-    await _notificationsPlugin.show(0, widget.receiverName, content, details);
+  void _showGroupParticipants() async {
+    final doc = await FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).get();
+    if (!doc.exists) return;
+
+    List<dynamic> participants = doc.data()?['participants'] ?? [];
+
+    if (mounted) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF1D222C),
+          title: const Text("Participants", style: TextStyle(color: Colors.white)),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 300,
+            child: ListView.builder(
+              itemCount: participants.length,
+              itemBuilder: (context, index) {
+                return FutureBuilder<DocumentSnapshot>(
+                  future: FirebaseFirestore.instance.collection('users').doc(participants[index]).get(),
+                  builder: (context, snap) {
+                    if (!snap.hasData) return const SizedBox();
+                    var user = snap.data!.data() as Map<String, dynamic>;
+                    return ListTile(
+                      leading: CircleAvatar(
+                        backgroundImage: user['profilePic'] != null ? MemoryImage(base64Decode(user['profilePic'])) : null,
+                        child: user['profilePic'] == null ? Text((user['username'] ?? "U")[0].toUpperCase()) : null,
+                      ),
+                      title: Text(user['username'] ?? "User", style: const TextStyle(color: Colors.white)),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("Close"))],
+        ),
+      );
+    }
   }
 
   bool _isBase64(String str) {
@@ -177,26 +319,21 @@ class _ChatScreenState extends State<ChatScreen> {
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Video calling requires external API integration.")));
   }
 
-  // --- NEW: TOGGLE MUTE ---
   void _toggleMute() async {
     final roomId = _getRoomId();
     final uid = FirebaseAuth.instance.currentUser!.uid;
-    // We toggle the current local state immediately for UI responsiveness
-    // logic will be confirmed by Firestore listener
     await FirebaseFirestore.instance.collection('chat_rooms').doc(roomId).set({
       'mutedFor': {uid: !_isMuted}
     }, SetOptions(merge: true));
   }
 
-  // --- NEW: DELETE CHAT ---
   void _deleteChat() async {
-    // Show Confirmation Dialog
     bool confirm = await showDialog(
       context: context, 
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF1D222C),
         title: const Text("Delete Chat?", style: TextStyle(color: Colors.white)),
-        content: const Text("This will permanently delete all messages for both users.", style: TextStyle(color: Colors.grey)),
+        content: const Text("This will permanently delete all messages.", style: TextStyle(color: Colors.grey)),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text("Cancel")),
           TextButton(onPressed: () => Navigator.pop(context, true), child: const Text("Delete", style: TextStyle(color: Colors.redAccent))),
@@ -207,35 +344,22 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!confirm) return;
 
     final roomId = _getRoomId();
-    
-    // 1. Delete Messages Subcollection
     final msgs = await FirebaseFirestore.instance.collection('chat_rooms').doc(roomId).collection('messages').get();
     final batch = FirebaseFirestore.instance.batch();
     
     for (var doc in msgs.docs) {
       batch.delete(doc.reference);
     }
-    
-    // 2. Delete Room Document
     batch.delete(FirebaseFirestore.instance.collection('chat_rooms').doc(roomId));
-    
     await batch.commit();
 
-    if (mounted) Navigator.pop(context); // Exit chat screen
-  }
-
-  @override
-  void dispose() {
-    _msgSubscription?.cancel();
-    _roomSubscription?.cancel(); // Cancel room listener
-    _msgController.dispose();
-    _recorder.dispose();
-    _scrollController.dispose();
-    _typingTimer?.cancel();
-    super.dispose();
+    if (mounted) Navigator.pop(context); 
   }
 
   String _getRoomId() {
+    if (widget.isGroup && widget.roomId != null) {
+      return widget.roomId!;
+    }
     List<String> ids = [FirebaseAuth.instance.currentUser!.uid, widget.receiverUserID];
     ids.sort(); return ids.join('_');
   }
@@ -309,8 +433,15 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _editingMsgId = null);
     } else {
       final messageData = {
-        'senderId': senderId, 'receiverId': widget.receiverUserID, 'message': msg, 'type': type, 'timestamp': timestamp, 'isRead': false, 
-        'replyToText': currentReplyText, 'replyToUserId': currentReplySenderId, 'replyToMessageId': currentReplyMessageId
+        'senderId': senderId, 
+        'receiverId': widget.isGroup ? roomId : widget.receiverUserID, 
+        'message': msg, 
+        'type': type, 
+        'timestamp': timestamp, 
+        'isRead': false, 
+        'replyToText': currentReplyText, 
+        'replyToUserId': currentReplySenderId, 
+        'replyToMessageId': currentReplyMessageId
       };
 
       WriteBatch batch = FirebaseFirestore.instance.batch();
@@ -319,8 +450,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
       batch.set(msgRef, messageData);
       String preview = type == 'image' ? '📷 Photo' : (type == 'audio' ? '🎤 Voice' : msg);
+      
+      // --- FIX: Don't set participants to null for groups, use conditional map key ---
       batch.set(roomRef, {
-        'participants': [senderId, widget.receiverUserID], 'lastMessage': preview, 'lastMessageTimestamp': timestamp,
+        if (!widget.isGroup) 'participants': [senderId, widget.receiverUserID],
+        'lastMessage': preview, 
+        'lastMessageTimestamp': timestamp,
       }, SetOptions(merge: true));
 
       await batch.commit();
@@ -370,61 +505,97 @@ class _ChatScreenState extends State<ChatScreen> {
         automaticallyImplyLeading: true,
         title: GestureDetector(
           onTap: () {
-            Navigator.push(context, MaterialPageRoute(builder: (context) => OtherUserProfilePage(userId: widget.receiverUserID, userName: widget.receiverName)));
+            if (widget.isGroup) {
+              _showGroupParticipants();
+            } else {
+               Navigator.push(context, MaterialPageRoute(builder: (context) => OtherUserProfilePage(userId: widget.receiverUserID, userName: widget.receiverName)));
+            }
           },
           child: Row(
             children: [
-              StreamBuilder<DocumentSnapshot>(
-                stream: FirebaseFirestore.instance.collection('users').doc(widget.receiverUserID).snapshots(),
-                builder: (context, snap) {
-                  var data = snap.data?.data() as Map<String, dynamic>?;
-                  String? pic = data?['profilePic'];
-                  return Container(
-                    padding: const EdgeInsets.all(1.5),
-                    decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: const Color(0xFF2B303B))),
-                    child: CircleAvatar(
-                      radius: 20,
-                      backgroundColor: Colors.grey.shade800,
-                      backgroundImage: pic != null ? MemoryImage(base64Decode(pic)) : null,
-                      child: pic == null ? Text(widget.receiverName[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 16)) : null,
-                    ),
-                  );
-                },
-              ),
+              if (widget.isGroup)
+                StreamBuilder<DocumentSnapshot>(
+                  stream: FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).snapshots(),
+                  builder: (context, snapshot) {
+                    var data = snapshot.data?.data() as Map<String, dynamic>?;
+                    String? groupPic = data?['groupPic'];
+                    
+                    return GestureDetector(
+                      onTap: _updateGroupPic, 
+                      child: Container(
+                        padding: const EdgeInsets.all(1.5),
+                        decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: const Color(0xFF2B303B))),
+                        child: CircleAvatar(
+                          radius: 20,
+                          backgroundColor: const Color(0xFF2B303B),
+                          backgroundImage: groupPic != null ? MemoryImage(base64Decode(groupPic)) : null,
+                          child: groupPic == null ? const Icon(Icons.group, color: Colors.white) : null,
+                        ),
+                      ),
+                    );
+                  }
+                )
+              else 
+                StreamBuilder<DocumentSnapshot>(
+                  stream: FirebaseFirestore.instance.collection('users').doc(widget.receiverUserID).snapshots(),
+                  builder: (context, snap) {
+                    if (snap.connectionState == ConnectionState.waiting && !snap.hasData) {
+                       return Container(width: 40, height: 40, decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF2B303B)));
+                    }
+                    var data = snap.data?.data() as Map<String, dynamic>?;
+                    String? pic = data?['profilePic'];
+                    return Container(
+                      padding: const EdgeInsets.all(1.5),
+                      decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: const Color(0xFF2B303B))),
+                      child: CircleAvatar(
+                        radius: 20,
+                        backgroundColor: Colors.grey.shade800,
+                        backgroundImage: pic != null ? MemoryImage(base64Decode(pic)) : null,
+                        child: pic == null ? Text(widget.receiverName[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 16)) : null,
+                      ),
+                    );
+                  },
+                ),
+              
               const SizedBox(width: 12),
+              
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(widget.receiverName, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 2),
-                    StreamBuilder<DocumentSnapshot>(
-                      stream: FirebaseFirestore.instance.collection('users').doc(widget.receiverUserID).snapshots(),
-                      builder: (context, userSnap) {
-                        bool isOnline = false;
-                        if (userSnap.hasData && userSnap.data != null && userSnap.data!.exists) {
-                           final userData = userSnap.data!.data() as Map<String, dynamic>;
-                           isOnline = userData['isOnline'] ?? false;
-                        }
-                        return StreamBuilder<DocumentSnapshot>(
-                          stream: FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).snapshots(),
-                          builder: (context, roomSnap) {
-                            bool typing = false;
-                            if (roomSnap.hasData && roomSnap.data!.exists) {
-                              var data = roomSnap.data!.data() as Map<String, dynamic>;
-                              typing = data['typingStatus']?[widget.receiverUserID] ?? false;
-                            }
-                            String statusText = typing ? "typing..." : (isOnline ? "Online" : "Offline");
-                            Color statusColor = typing ? const Color(0xFF375FFF) : (isOnline ? const Color(0xFF00C853) : Colors.grey);
-                            return Row(children: [
-                                if (isOnline || typing) Container(width: 7, height: 7, decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle)),
-                                if (isOnline || typing) const SizedBox(width: 5),
-                                Text(statusText, style: TextStyle(color: statusColor == const Color(0xFF00C853) ? Colors.white70 : statusColor, fontSize: 12)),
-                            ]);
-                          },
-                        );
-                      },
-                    )
+                    
+                    if (!widget.isGroup)
+                      StreamBuilder<DocumentSnapshot>(
+                        stream: FirebaseFirestore.instance.collection('users').doc(widget.receiverUserID).snapshots(),
+                        builder: (context, userSnap) {
+                          bool isOnline = false;
+                          if (userSnap.hasData && userSnap.data != null && userSnap.data!.exists) {
+                             final userData = userSnap.data!.data() as Map<String, dynamic>;
+                             isOnline = userData['isOnline'] ?? false;
+                          }
+                          return StreamBuilder<DocumentSnapshot>(
+                            stream: FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).snapshots(),
+                            builder: (context, roomSnap) {
+                              bool typing = false;
+                              if (roomSnap.hasData && roomSnap.data!.exists) {
+                                var data = roomSnap.data!.data() as Map<String, dynamic>;
+                                typing = data['typingStatus']?[widget.receiverUserID] ?? false;
+                              }
+                              String statusText = typing ? "typing..." : (isOnline ? "Online" : "Offline");
+                              Color statusColor = typing ? const Color(0xFF375FFF) : (isOnline ? const Color(0xFF00C853) : Colors.grey);
+                              return Row(children: [
+                                  if (isOnline || typing) Container(width: 7, height: 7, decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle)),
+                                  if (isOnline || typing) const SizedBox(width: 5),
+                                  Text(statusText, style: TextStyle(color: statusColor == const Color(0xFF00C853) ? Colors.white70 : statusColor, fontSize: 12)),
+                              ]);
+                            },
+                          );
+                        },
+                      )
+                    else 
+                      const Text("Tap for info", style: TextStyle(color: Colors.grey, fontSize: 12)),
                   ],
                 ),
               ),
@@ -432,10 +603,11 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         actions: [
-          IconButton(icon: const Icon(Icons.call), onPressed: _makePhoneCall),
-          IconButton(icon: const Icon(Icons.videocam), onPressed: _makeVideoCall),
+          if (!widget.isGroup) ...[
+            IconButton(icon: const Icon(Icons.call), onPressed: _makePhoneCall),
+            IconButton(icon: const Icon(Icons.videocam), onPressed: _makeVideoCall),
+          ],
           
-          // --- UPDATED CONTEXT MENU ---
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             color: const Color(0xFF1D222C),
@@ -531,6 +703,7 @@ class _ChatScreenState extends State<ChatScreen> {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           itemCount: docs.length,
           cacheExtent: 1000, 
+          addAutomaticKeepAlives: true,
           itemBuilder: (context, index) {
             var doc = docs[index];
             if (!_messageKeys.containsKey(doc.id)) _messageKeys[doc.id] = GlobalKey();
@@ -540,6 +713,8 @@ class _ChatScreenState extends State<ChatScreen> {
               data: doc.data() as Map<String, dynamic>,
               id: doc.id,
               isMe: doc['senderId'] == FirebaseAuth.instance.currentUser!.uid,
+              // --- FIX: Pass isGroup to MessageBubble ---
+              isGroup: widget.isGroup,
               onLongPress: _showOptions,
               onReplyTap: _scrollToMessage,
               onImageTap: (img) => Navigator.push(context, MaterialPageRoute(builder: (_) => FullScreenImage(base64Image: img))),
@@ -647,13 +822,15 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
-class MessageBubble extends StatelessWidget {
+class MessageBubble extends StatefulWidget {
   final Map<String, dynamic> data;
   final String id;
   final bool isMe;
   final Function(Map<String, dynamic>, String, bool) onLongPress;
   final Function(String) onReplyTap;
   final Function(String) onImageTap;
+  // --- FIX: Add isGroup parameter ---
+  final bool isGroup;
 
   const MessageBubble({
     super.key,
@@ -663,70 +840,126 @@ class MessageBubble extends StatelessWidget {
     required this.onLongPress,
     required this.onReplyTap,
     required this.onImageTap,
+    this.isGroup = false,
   });
+
+  @override
+  State<MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<MessageBubble> {
+  Uint8List? _decodedImage;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.data['type'] == 'image' && widget.data['message'] != null) {
+      _decodedImage = base64Decode(widget.data['message']);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     String time = "";
-    if (data['timestamp'] != null) {
-      DateTime dt = (data['timestamp'] as Timestamp).toDate();
+    if (widget.data['timestamp'] != null) {
+      DateTime dt = (widget.data['timestamp'] as Timestamp).toDate();
       time = DateFormat('h:mm a').format(dt);
     }
-    bool isPhoto = data['type'] == 'image';
+    bool isPhoto = widget.data['type'] == 'image';
+
+    // --- FIX: Logic to build MessageBubble content ---
+    Widget bubbleContent = Container(
+      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        gradient: widget.data['type'] == 'audio' ? const LinearGradient(colors: [Color(0xFF7B51FF), Color(0xFF375FFF)]) : null,
+        color: widget.data['type'] == 'audio' ? null : (widget.isMe ? const Color(0xFF1D222C) : const Color(0xFF161A22)),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          widget.data['type'] == 'audio'
+              ? VoiceWaveformBubble(base64Audio: widget.data['message'])
+              : isPhoto
+                  ? GestureDetector(
+                      onTap: () => widget.onImageTap(widget.data['message']),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: _decodedImage != null 
+                            ? Image.memory(_decodedImage!, gaplessPlayback: true) 
+                            : const SizedBox(),
+                      ),
+                    )
+                  : Text(widget.data['message'], style: const TextStyle(color: Colors.white, fontSize: 15)),
+        ],
+      ),
+    );
+
+    // --- FIX: Wrap in Row if Group Chat and Not Me ---
+    Widget messageRow;
+    if (widget.isGroup && !widget.isMe) {
+      messageRow = Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          StreamBuilder<DocumentSnapshot>(
+            stream: FirebaseFirestore.instance.collection('users').doc(widget.data['senderId']).snapshots(),
+            builder: (context, snapshot) {
+              if (!snapshot.hasData) return const SizedBox(width: 32);
+              var userData = snapshot.data!.data() as Map<String, dynamic>?;
+              String? pic = userData?['profilePic'];
+              String name = userData?['username'] ?? "U";
+              
+              return Container(
+                margin: const EdgeInsets.only(right: 8, bottom: 4),
+                child: CircleAvatar(
+                  radius: 16,
+                  backgroundColor: Colors.grey.shade800,
+                  backgroundImage: pic != null ? MemoryImage(base64Decode(pic)) : null,
+                  child: pic == null ? Text(name[0].toUpperCase(), style: const TextStyle(fontSize: 12, color: Colors.white)) : null,
+                ),
+              );
+            },
+          ),
+          bubbleContent,
+        ],
+      );
+    } else {
+      messageRow = bubbleContent;
+    }
 
     return GestureDetector(
-      onLongPress: () => onLongPress(data, id, isMe),
+      onLongPress: () => widget.onLongPress(widget.data, widget.id, widget.isMe),
       child: Container(
         margin: const EdgeInsets.only(bottom: 20),
         child: Column(
-          crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          crossAxisAlignment: widget.isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
-            if (data['replyToText'] != null)
+            if (widget.data['replyToText'] != null)
               GestureDetector(
                 onTap: () {
-                   if (data['replyToMessageId'] != null) onReplyTap(data['replyToMessageId']);
+                   if (widget.data['replyToMessageId'] != null) widget.onReplyTap(widget.data['replyToMessageId']);
                 },
                 child: Container(
-                  margin: EdgeInsets.only(bottom: 4, left: isMe ? 0 : 10, right: isMe ? 10 : 0),
+                  margin: EdgeInsets.only(bottom: 4, left: widget.isMe ? 0 : (widget.isGroup && !widget.isMe ? 40 : 10), right: widget.isMe ? 10 : 0),
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  decoration: BoxDecoration(border: Border(left: BorderSide(color: isMe ? Colors.white54 : const Color(0xFF7B51FF), width: 3))),
-                  child: Text("Replying to: ${data['replyToText']}", maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                  decoration: BoxDecoration(border: Border(left: BorderSide(color: widget.isMe ? Colors.white54 : const Color(0xFF7B51FF), width: 3))),
+                  child: Text("Replying to: ${widget.data['replyToText']}", maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey, fontSize: 11)),
                 ),
               ),
             
-            Container(
-              constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                gradient: data['type'] == 'audio' ? const LinearGradient(colors: [Color(0xFF7B51FF), Color(0xFF375FFF)]) : null,
-                color: data['type'] == 'audio' ? null : (isMe ? const Color(0xFF1D222C) : const Color(0xFF161A22)),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  data['type'] == 'audio'
-                      ? VoiceWaveformBubble(base64Audio: data['message'])
-                      : isPhoto
-                          ? GestureDetector(
-                              onTap: () => onImageTap(data['message']),
-                              child: ClipRRect(borderRadius: BorderRadius.circular(12), child: Image.memory(base64Decode(data['message']), gaplessPlayback: true)),
-                            )
-                          : Text(data['message'], style: const TextStyle(color: Colors.white, fontSize: 15)),
-                ],
-              ),
-            ),
+            messageRow, // Insert the conditional row here
             
             Padding(
-              padding: const EdgeInsets.only(top: 6, left: 4, right: 4),
+              padding: EdgeInsets.only(top: 6, left: widget.isGroup && !widget.isMe ? 40 : 4, right: 4),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (data['isEdited'] == true) const Text("edited • ", style: TextStyle(fontSize: 10, color: Colors.grey)),
+                  if (widget.data['isEdited'] == true) const Text("edited • ", style: TextStyle(fontSize: 10, color: Colors.grey)),
                   Text(time, style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                  if (isMe) ...[
+                  if (widget.isMe) ...[
                     const SizedBox(width: 4),
-                    Icon(Icons.done_all, size: 15, color: data['isRead'] == true ? const Color(0xFF7B51FF) : Colors.grey),
+                    Icon(Icons.done_all, size: 15, color: widget.data['isRead'] == true ? const Color(0xFF7B51FF) : Colors.grey),
                   ]
                 ],
               ),

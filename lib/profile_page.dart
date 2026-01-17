@@ -34,12 +34,14 @@ class ProfilePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final uid = FirebaseAuth.instance.currentUser!.uid;
+    // Safety check: if user is null (signed out), don't build to avoid crashes
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return const SizedBox(); 
+    final uid = user.uid;
 
     return Scaffold(
       backgroundColor: const Color(0xFF101216), 
       appBar: AppBar(
-        title: const Text("Profile"),
         centerTitle: true,
         backgroundColor: const Color(0xFF101216),
         elevation: 0,
@@ -47,9 +49,12 @@ class ProfilePage extends StatelessWidget {
           // SIGN OUT BUTTON IN CONTEXT MENU
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert, color: Colors.white),
-            onSelected: (value) {
+            onSelected: (value) async {
               if (value == 'logout') {
-                FirebaseAuth.instance.signOut();
+                // Pop until the first route to clear the stack (removes ProfilePage)
+                // This ensures we land cleanly on the Login page provided by AuthGate
+                Navigator.of(context).popUntil((route) => route.isFirst);
+                await FirebaseAuth.instance.signOut();
               }
             },
             color: const Color(0xFF1D222C),
@@ -81,7 +86,7 @@ class ProfilePage extends StatelessWidget {
           return Container(
             margin: const EdgeInsets.only(top: 10),
             decoration: const BoxDecoration(
-              color: Color(0xFF161A22), // Fixed Color: Made it lighter so card is visible
+              color: Color(0xFF161A22), 
               borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
             ),
             child: SingleChildScrollView(
@@ -129,7 +134,7 @@ class ProfilePage extends StatelessWidget {
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(color: const Color(0xFF1D222C), borderRadius: BorderRadius.circular(20)),
+                    decoration: BoxDecoration(color: const Color(0xFF101216), borderRadius: BorderRadius.circular(20)),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -155,13 +160,12 @@ class ProfilePage extends StatelessWidget {
                   const SizedBox(height: 15),
                   
                   StreamBuilder<QuerySnapshot>(
-                    // REMOVED .orderBy('timestamp') to ensure visibility without custom index
                     stream: FirebaseFirestore.instance.collection('posts').where('userId', isEqualTo: uid).snapshots(),
                     builder: (context, postSnap) {
                       if (!postSnap.hasData) return const SizedBox();
                       final posts = postSnap.data!.docs;
                       
-                      // Sort manually in client since we removed backend sort
+                      // Sort manually
                       posts.sort((a, b) => (b['timestamp'] as Timestamp).compareTo(a['timestamp'] as Timestamp));
 
                       return GridView.builder(
@@ -170,9 +174,23 @@ class ProfilePage extends StatelessWidget {
                         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, crossAxisSpacing: 15, mainAxisSpacing: 15, childAspectRatio: 1),
                         itemCount: posts.length,
                         itemBuilder: (context, index) {
-                          return ClipRRect(
-                            borderRadius: BorderRadius.circular(20),
-                            child: Image.memory(base64Decode(posts[index]['image']), fit: BoxFit.cover),
+                          final imageString = posts[index]['image'];
+                          final postId = posts[index].id;
+                          
+                          return GestureDetector(
+                            onTap: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  // Pass postId for deletion
+                                  builder: (context) => FullScreenPost(base64Image: imageString, postId: postId),
+                                ),
+                              );
+                            },
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(20),
+                              child: Image.memory(base64Decode(imageString), fit: BoxFit.cover),
+                            ),
                           );
                         },
                       );
@@ -200,5 +218,65 @@ class ProfilePage extends StatelessWidget {
 
   String _formatDate(dynamic date) {
     return date ?? "Jan 01, 2000"; 
+  }
+}
+
+// --- UPDATED FULL SCREEN WIDGET ---
+class FullScreenPost extends StatelessWidget {
+  final String base64Image;
+  final String postId; // Added Post ID
+  
+  const FullScreenPost({super.key, required this.base64Image, required this.postId});
+
+  void _deletePost(BuildContext context) async {
+    // Delete from Firestore
+    await FirebaseFirestore.instance.collection('posts').doc(postId).delete();
+    // Close the screen
+    if (context.mounted) {
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+        actions: [
+          // DELETE CONTEXT MENU
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert, color: Colors.white),
+            onSelected: (value) {
+              if (value == 'delete') {
+                _deletePost(context);
+              }
+            },
+            color: const Color(0xFF1D222C),
+            itemBuilder: (BuildContext context) {
+              return [
+                const PopupMenuItem(
+                  value: 'delete',
+                  child: Row(
+                    children: [
+                      Icon(Icons.delete, color: Colors.redAccent, size: 20),
+                      SizedBox(width: 10),
+                      Text("Delete Post", style: TextStyle(color: Colors.redAccent)),
+                    ],
+                  ),
+                ),
+              ];
+            },
+          ),
+        ],
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          child: Image.memory(base64Decode(base64Image)),
+        ),
+      ),
+    );
   }
 }

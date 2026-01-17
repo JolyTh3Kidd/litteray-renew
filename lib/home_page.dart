@@ -4,6 +4,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'main.dart'; // To access ChatScreen
 import 'user_list_page.dart';
+import 'group_selection_page.dart'; // Import the new file
 import 'profile_page.dart';
 
 class HomePage extends StatefulWidget {
@@ -15,11 +16,43 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final FirebaseAuth _auth = FirebaseAuth.instance;
 
-  // Design Colors
-  final Color _headerColor = const Color(0xFF292F3F); 
+  final Color _headerColor = const Color(0xFF1D222C); 
   final Color _chatListColor = const Color(0xFF101216); 
   final Color _inputBackgroundColor = const Color(0xFF1D222C);
   final Color _accentBlue = const Color(0xFF375FFF);
+
+  void _showFabOptions() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: _headerColor,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20),
+          child: Wrap(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.chat_bubble_outline, color: Colors.white),
+                title: const Text("Open all chats", style: TextStyle(color: Colors.white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => const UserListPage()));
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.group_add_outlined, color: Colors.white),
+                title: const Text("Create Group Chat", style: TextStyle(color: Colors.white)),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => const GroupSelectionPage()));
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -28,7 +61,7 @@ class _HomePageState extends State<HomePage> {
       body: SafeArea(
         child: Column(
           children: [
-            // --- TOP AREA: PROFILE HEADER (Hi, User!) ---
+            // PROFILE HEADER
             StreamBuilder<DocumentSnapshot>(
               stream: FirebaseFirestore.instance.collection('users').doc(_auth.currentUser!.uid).snapshots(),
               builder: (context, snapshot) {
@@ -42,7 +75,7 @@ class _HomePageState extends State<HomePage> {
                   onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfilePage())),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 25.0),
-                    color: Colors.transparent, // Ensures the whole area is clickable
+                    color: Colors.transparent, 
                     child: Row(
                       children: [
                         CircleAvatar(
@@ -63,7 +96,7 @@ class _HomePageState extends State<HomePage> {
               },
             ),
 
-            // --- BOTTOM AREA: CHAT LIST WITH ROUNDED SHEET ---
+            // CHAT LIST
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
@@ -89,16 +122,26 @@ class _HomePageState extends State<HomePage> {
                       itemCount: rooms.length,
                       itemBuilder: (context, index) {
                         var roomData = rooms[index].data() as Map<String, dynamic>;
-                        var otherId = (roomData['participants'] as List).firstWhere((id) => id != _auth.currentUser!.uid);
+                        bool isGroup = roomData['isGroup'] ?? false;
                         
-                        return FutureBuilder<DocumentSnapshot>(
-                          future: FirebaseFirestore.instance.collection('users').doc(otherId).get(),
-                          builder: (context, userSnap) {
-                            if (!userSnap.hasData) return const SizedBox();
-                            var userData = userSnap.data!.data() as Map<String, dynamic>? ?? {};
-                            return _buildTile(userData, roomData, rooms[index].id);
-                          },
-                        );
+                        if (isGroup) {
+                          return GroupChatTile(
+                            roomData: roomData, 
+                            roomId: rooms[index].id,
+                            currentUserId: _auth.currentUser!.uid,
+                            accentBlue: _accentBlue, 
+                            inputBackgroundColor: _inputBackgroundColor
+                          );
+                        } else {
+                          var otherId = (roomData['participants'] as List).firstWhere((id) => id != _auth.currentUser!.uid, orElse: () => "");
+                          return ChatTile(
+                            roomId: rooms[index].id,
+                            otherUserId: otherId,
+                            currentUserId: _auth.currentUser!.uid,
+                            accentBlue: _accentBlue,
+                            inputBackgroundColor: _inputBackgroundColor,
+                          );
+                        }
                       },
                     );
                   },
@@ -109,96 +152,172 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
 
-      // FAB to start new chat
       floatingActionButton: FloatingActionButton(
         backgroundColor: _accentBlue,
-        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const UserListPage())),
+        onPressed: _showFabOptions,
         child: const Icon(Icons.add, color: Colors.white),
       ),
     );
   }
+}
 
-  Widget _buildTile(Map<String, dynamic> user, Map<String, dynamic> room, String id) {
-    String name = user['username'] ?? user['name'] ?? "User";
-    String? pic = user['profilePic']; 
-    
-    // --- ONLINE STATUS LOGIC ---
-    bool isOnline = user['isOnline'] ?? false;
-    Color borderColor = isOnline ? _accentBlue : Colors.grey;
+// --- UPDATED GROUP WIDGET TO SHOW AVATAR ---
+class GroupChatTile extends StatelessWidget {
+  final Map<String, dynamic> roomData;
+  final String roomId;
+  final String currentUserId;
+  final Color accentBlue;
+  final Color inputBackgroundColor;
+
+  const GroupChatTile({
+    super.key,
+    required this.roomData,
+    required this.roomId,
+    required this.currentUserId,
+    required this.accentBlue,
+    required this.inputBackgroundColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    String groupName = roomData['groupName'] ?? "Group Chat";
+    String? groupPic = roomData['groupPic']; // Fetch group picture
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      onTap: () {
-        // Since we have the ID, we pass it to ChatScreen. 
-        // Note: ChatScreen needs receiverUserID, so we grab that from the user map or logic.
-        // The FutureBuilder above fetched by 'otherId', so user['uid'] might not be in the doc data depending on how you save it.
-        // It's safer to use the ID we used to fetch the doc.
-        // However, based on your previous code, we can assume logic holds.
-        // Let's find the ID again to be safe or assume it's in the map.
-        // For now, I will use the user['uid'] if present, or fallback.
-        // Actually, looking at previous code, let's just use the ID we derived earlier? 
-        // We can't access 'otherId' easily here without passing it. 
-        // Let's rely on the user map having the ID or just assume the click handles it.
-        // EDIT: Added 'uid' to the nav push just in case, but usually doc.id is the uid.
-         Navigator.push(context, MaterialPageRoute(builder: (_) => ChatScreen(receiverUserID: user['uid'] ?? "", receiverName: name)));
-      },
+      onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatScreen(
+        receiverUserID: "",
+        receiverName: groupName,
+        isGroup: true,
+        roomId: roomId,
+      ))),
       leading: Container(
-        padding: const EdgeInsets.all(2.5), // Space for the border
+        padding: const EdgeInsets.all(2.5),
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          border: Border.all(
-            color: borderColor, // Blue if online, Gray if offline
-            width: 2.5
-          ),
+          border: Border.all(color: Colors.transparent, width: 2.5),
         ),
         child: CircleAvatar(
-          radius: 30, // Slightly smaller to fit border
-          backgroundColor: _inputBackgroundColor,
-          backgroundImage: pic != null ? MemoryImage(base64Decode(pic)) : null,
-          child: pic == null ? Text(name[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)) : null,
+          radius: 30,
+          backgroundColor: inputBackgroundColor,
+          // --- UPDATED: Show group image if available ---
+          backgroundImage: groupPic != null ? MemoryImage(base64Decode(groupPic)) : null,
+          child: groupPic == null 
+              ? const Icon(Icons.group, color: Colors.white) 
+              : null,
         ),
       ),
-      title: Text(name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-      
+      title: Text(groupName, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
       subtitle: Padding(
         padding: const EdgeInsets.only(top: 4.0),
-        child: StreamBuilder<QuerySnapshot>(
-          stream: FirebaseFirestore.instance.collection('chat_rooms').doc(id).collection('messages')
-              .orderBy('timestamp', descending: true).limit(1).snapshots(),
-          builder: (context, snapshot) {
-            if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-              return const Text("", style: TextStyle(color: Colors.grey, fontSize: 14));
-            }
-
-            var msgData = snapshot.data!.docs.first.data() as Map<String, dynamic>;
-            String text = msgData['message'] ?? "";
-            String type = msgData['type'] ?? 'text';
-            String senderId = msgData['senderId'] ?? "";
-
-            String displayContent = type == 'image' ? '📷 Photo' : (type == 'audio' ? '🎤 Voice' : text);
-            String prefix = (senderId == _auth.currentUser!.uid) ? "You: " : "$name: ";
-
-            return Text(
-              "$prefix$displayContent",
-              style: const TextStyle(color: Colors.grey, fontSize: 14),
-              maxLines: 1, 
-              overflow: TextOverflow.ellipsis
-            );
-          },
+        child: Text(
+          roomData['lastMessage'] ?? "",
+          style: const TextStyle(color: Colors.grey, fontSize: 14),
+          maxLines: 1, 
+          overflow: TextOverflow.ellipsis
         ),
       ),
       trailing: StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance.collection('chat_rooms').doc(id).collection('messages')
-            .where('receiverId', isEqualTo: _auth.currentUser!.uid).where('isRead', isEqualTo: false).snapshots(),
-        builder: (context, snap) {
-          int count = snap.hasData ? snap.data!.docs.length : 0;
+        stream: FirebaseFirestore.instance.collection('chat_rooms').doc(roomId).collection('messages')
+            .where('receiverId', isEqualTo: currentUserId)
+            .where('isRead', isEqualTo: false).snapshots(),
+        builder: (context, countSnap) {
+          int count = countSnap.hasData ? countSnap.data!.docs.length : 0;
           return count > 0 ? Container(
             padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(color: _accentBlue, borderRadius: BorderRadius.circular(10)),
+            decoration: BoxDecoration(color: accentBlue, borderRadius: BorderRadius.circular(10)),
             child: Text(count.toString(), style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
           ) : const SizedBox.shrink();
         },
       ),
+    );
+  }
+}
+
+class ChatTile extends StatelessWidget {
+  final String roomId;
+  final String otherUserId;
+  final String currentUserId;
+  final Color accentBlue;
+  final Color inputBackgroundColor;
+
+  const ChatTile({
+    super.key,
+    required this.roomId,
+    required this.otherUserId,
+    required this.currentUserId,
+    required this.accentBlue,
+    required this.inputBackgroundColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<DocumentSnapshot>(
+      stream: FirebaseFirestore.instance.collection('users').doc(otherUserId).snapshots(),
+      builder: (context, userSnap) {
+        if (!userSnap.hasData) {
+          return const ListTile(
+            leading: CircleAvatar(backgroundColor: Colors.grey),
+            title: Text("Loading...", style: TextStyle(color: Colors.grey)),
+          ); 
+        }
+
+        var userData = userSnap.data!.data() as Map<String, dynamic>? ?? {};
+        String name = userData['username'] ?? userData['name'] ?? "User";
+        String? pic = userData['profilePic'];
+        bool isOnline = userData['isOnline'] ?? false;
+        Color borderColor = isOnline ? accentBlue : Colors.grey;
+
+        return ListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatScreen(receiverUserID: otherUserId, receiverName: name))),
+          leading: Container(
+            padding: const EdgeInsets.all(2.5),
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: borderColor, width: 2.5),
+            ),
+            child: CircleAvatar(
+              radius: 30,
+              backgroundColor: inputBackgroundColor,
+              backgroundImage: pic != null ? MemoryImage(base64Decode(pic)) : null,
+              child: pic == null ? Text(name[0].toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)) : null,
+            ),
+          ),
+          title: Text(name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
+          subtitle: Padding(
+            padding: const EdgeInsets.only(top: 4.0),
+            child: StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance.collection('chat_rooms').doc(roomId).collection('messages')
+                  .orderBy('timestamp', descending: true).limit(1).snapshots(),
+              builder: (context, msgSnap) {
+                if (!msgSnap.hasData || msgSnap.data!.docs.isEmpty) {
+                  return const Text("No messages yet", style: TextStyle(color: Colors.grey, fontSize: 14));
+                }
+                var msgData = msgSnap.data!.docs.first.data() as Map<String, dynamic>;
+                String text = msgData['message'] ?? "";
+                String type = msgData['type'] ?? 'text';
+                String senderId = msgData['senderId'] ?? "";
+                String displayContent = type == 'image' ? '📷 Photo' : (type == 'audio' ? '🎤 Voice' : text);
+                String prefix = (senderId == currentUserId) ? "You: " : "$name: ";
+                return Text("$prefix$displayContent", style: const TextStyle(color: Colors.grey, fontSize: 14), maxLines: 1, overflow: TextOverflow.ellipsis);
+              },
+            ),
+          ),
+          trailing: StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance.collection('chat_rooms').doc(roomId).collection('messages')
+                .where('receiverId', isEqualTo: currentUserId).where('isRead', isEqualTo: false).snapshots(),
+            builder: (context, countSnap) {
+              int count = countSnap.hasData ? countSnap.data!.docs.length : 0;
+              return count > 0 ? Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: accentBlue, borderRadius: BorderRadius.circular(10)),
+                child: Text(count.toString(), style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+              ) : const SizedBox.shrink();
+            },
+          ),
+        );
+      },
     );
   }
 }

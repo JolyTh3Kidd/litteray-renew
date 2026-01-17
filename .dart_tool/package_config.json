@@ -170,6 +170,24 @@
       "languageVersion": "3.4"
     },
     {
+      "name": "firebase_messaging",
+      "rootUri": "file:///Users/jolyth3kidd/.pub-cache/hosted/pub.dev/firebase_messaging-16.1.0",
+      "packageUri": "lib/",
+      "languageVersion": "3.2"
+    },
+    {
+      "name": "firebase_messaging_platform_interface",
+      "rootUri": "file:///Users/jolyth3kidd/.pub-cache/hosted/pub.dev/firebase_messaging_platform_interface-4.7.5",
+      "packageUri": "lib/",
+      "languageVersion": "3.2"
+    },
+    {
+      "name": "firebase_messaging_web",
+      "rootUri": "file:///Users/jolyth3kidd/.pub-cache/hosted/pub.dev/firebase_messaging_web-4.1.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.4"
+    },
+    {
       "name": "fixnum",
       "rootUri": "file:///Users/jolyth3kidd/.pub-cache/hosted/pub.dev/fixnum-1.1.1",
       "packageUri": "lib/",
