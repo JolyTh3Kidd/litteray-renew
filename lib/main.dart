@@ -12,14 +12,34 @@ import 'package:audio_waveforms/audio_waveforms.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:record/record.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:url_launcher/url_launcher.dart'; 
 import 'firebase_options.dart';
 import 'auth_gate.dart';
 import 'other_user_profile_page.dart';
 
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  FlutterLocalNotificationsPlugin notificationsPlugin = FlutterLocalNotificationsPlugin();
+  const AndroidInitializationSettings androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher'); 
+  const InitializationSettings settings = InitializationSettings(android: androidSettings);
+  await notificationsPlugin.initialize(settings);
+  const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    'chat_channel_id', 'Messages', importance: Importance.max, priority: Priority.high, playSound: true,
+  );
+  const NotificationDetails details = NotificationDetails(android: androidDetails);
+  await notificationsPlugin.show(
+    DateTime.now().millisecond, 
+    message.notification?.title ?? "New Message", 
+    message.notification?.body ?? "", 
+    details
+  );
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
   runApp(const MessengerApp());
 }
 
@@ -40,6 +60,7 @@ class _MessengerAppState extends State<MessengerApp> with WidgetsBindingObserver
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initNotifications();
+    _initFirebaseMessaging();
     _startGlobalListener();
   }
 
@@ -60,6 +81,18 @@ class _MessengerAppState extends State<MessengerApp> with WidgetsBindingObserver
     const InitializationSettings settings = InitializationSettings(android: androidSettings);
     await _notificationsPlugin.initialize(settings);
     _notificationsPlugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();
+  }
+
+  void _initFirebaseMessaging() async {
+    FirebaseMessaging messaging = FirebaseMessaging.instance;
+    await messaging.requestPermission();
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      if (_appState != AppLifecycleState.resumed) {
+        _showNotification(message.notification?.body ?? "New Message");
+      }
+    });
+    FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+    });
   }
 
   void _startGlobalListener() {
@@ -169,12 +202,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   String? _replyingToSenderId;
   String? _replyingToMessageId; 
 
-  int _limit = 30;
+  final int _limit = 30;
   final int _limitIncrement = 20;
   
   StreamSubscription? _roomSubscription;
   
   final Map<String, GlobalKey> _messageKeys = {};
+
+  List<Message> messages = [];
+  bool isLoading = true;
+  bool loadingMore = false;
+  DocumentSnapshot? lastDoc;
+  StreamSubscription? newMsgSub;
+  Map<String, Future<DocumentSnapshot>> userFutures = {};
+  Map<String, Uint8List> imageCache = {};
+  Map<String, Uint8List> userImageCache = {};
 
   @override
   void initState() {
@@ -183,11 +225,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _setUserStatus(true);
     _markAsRead();
     _listenForRoomChanges();
+    loadInitial();
     
     _scrollController.addListener(() {
       if (_scrollController.hasClients && 
-          _scrollController.position.pixels >= _scrollController.position.maxScrollExtent - 200) {
-         setState(() => _limit += _limitIncrement);
+          _scrollController.position.pixels <= 200 && !loadingMore) {
+         loadMore();
       }
     });
   }
@@ -197,6 +240,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _setUserStatus(false);
     _roomSubscription?.cancel();
+    newMsgSub?.cancel();
     _msgController.dispose();
     _recorder.dispose();
     _scrollController.dispose();
@@ -234,6 +278,43 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           });
         }
       }
+    });
+  }
+
+  void loadInitial() async {
+    final snap = await FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).collection('messages')
+      .orderBy('timestamp', descending: true).limit(_limit).get();
+    setState(() {
+      messages = snap.docs.map((d) => Message(d.data(), d.id)).toList();
+      if (snap.docs.isNotEmpty) lastDoc = snap.docs.last;
+      isLoading = false;
+    });
+    newMsgSub = FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).collection('messages')
+      .orderBy('timestamp', descending: true).limit(1).snapshots().listen((snap) {
+        if (snap.docs.isNotEmpty) {
+          var newDoc = snap.docs.first;
+          if (messages.isEmpty || newDoc.id != messages.first.id) {
+            setState(() {
+              messages.insert(0, Message(newDoc.data(), newDoc.id));
+            });
+            var data = newDoc.data();
+            if (data['receiverId'] == FirebaseAuth.instance.currentUser!.uid && data['isRead'] == false) {
+              _markAsRead();
+            }
+          }
+        }
+      });
+  }
+
+  void loadMore() async {
+    if (loadingMore || lastDoc == null) return;
+    setState(() => loadingMore = true);
+    final snap = await FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).collection('messages')
+      .orderBy('timestamp', descending: true).startAfterDocument(lastDoc!).limit(_limitIncrement).get();
+    setState(() {
+      messages.addAll(snap.docs.map((d) => Message(d.data(), d.id)));
+      if (snap.docs.isNotEmpty) lastDoc = snap.docs.last;
+      loadingMore = false;
     });
   }
 
@@ -302,9 +383,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       
       if (phone != null && phone.isNotEmpty && phone != 'Hidden') {
         final Uri launchUri = Uri(scheme: 'tel', path: phone);
-        if (await canLaunchUrl(launchUri)) {
+        try {
           await launchUrl(launchUri);
-        } else {
+        } catch (e) {
           if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Could not launch dialer")));
         }
       } else {
@@ -372,7 +453,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     if (querySnapshot.docs.isNotEmpty) {
       WriteBatch batch = FirebaseFirestore.instance.batch();
-      for (var doc in querySnapshot.docs) batch.update(doc.reference, {'isRead': true});
+      for (var doc in querySnapshot.docs) {
+        batch.update(doc.reference, {'isRead': true});
+      }
       await batch.commit();
     }
   }
@@ -451,11 +534,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       batch.set(msgRef, messageData);
       String preview = type == 'image' ? '📷 Photo' : (type == 'audio' ? '🎤 Voice' : msg);
       
-      // --- FIX: Don't set participants to null for groups, use conditional map key ---
       batch.set(roomRef, {
         if (!widget.isGroup) 'participants': [senderId, widget.receiverUserID],
         'lastMessage': preview, 
         'lastMessageTimestamp': timestamp,
+        'lastMessageSenderId': senderId,
       }, SetOptions(merge: true));
 
       await batch.commit();
@@ -463,7 +546,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _updateTyping(false);
   }
 
-  // --- UI ---
+  // UI
 
   void _showOptions(Map<String, dynamic> data, String msgId, bool isMe) {
     bool isPhoto = data['type'] == 'image';
@@ -685,41 +768,36 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Widget _buildList() {
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection('chat_rooms').doc(_getRoomId()).collection('messages')
-          .orderBy('timestamp', descending: true).limit(_limit).snapshots(),
-      builder: (context, snapshot) {
-        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFF375FFF)));
-        final docs = snapshot.data!.docs;
-        
-        if (docs.isNotEmpty) {
-           var latest = docs.first.data() as Map<String, dynamic>;
-           if (latest['receiverId'] == FirebaseAuth.instance.currentUser!.uid && latest['isRead'] == false) _markAsRead();
+    if (isLoading) return const Center(child: CircularProgressIndicator(color: Color(0xFF375FFF)));
+    return ListView.builder(
+      controller: _scrollController,
+      reverse: true,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      itemCount: messages.length + (loadingMore ? 1 : 0),
+      cacheExtent: 1000, 
+      addAutomaticKeepAlives: true,
+      itemBuilder: (context, index) {
+        if (index == messages.length) {
+          return const Center(child: CircularProgressIndicator(color: Color(0xFF375FFF)));
         }
+        var msg = messages[index];
+        if (!_messageKeys.containsKey(msg.id)) _messageKeys[msg.id] = GlobalKey();
+        
+        final isMe = msg.data['senderId'] == FirebaseAuth.instance.currentUser!.uid;
+        final userFuture = widget.isGroup && !isMe ? (userFutures[msg.data['senderId']] ??= FirebaseFirestore.instance.collection('users').doc(msg.data['senderId']).get()) : null;
 
-        return ListView.builder(
-          controller: _scrollController,
-          reverse: true,
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-          itemCount: docs.length,
-          cacheExtent: 1000, 
-          addAutomaticKeepAlives: true,
-          itemBuilder: (context, index) {
-            var doc = docs[index];
-            if (!_messageKeys.containsKey(doc.id)) _messageKeys[doc.id] = GlobalKey();
-            
-            return MessageBubble(
-              key: _messageKeys[doc.id],
-              data: doc.data() as Map<String, dynamic>,
-              id: doc.id,
-              isMe: doc['senderId'] == FirebaseAuth.instance.currentUser!.uid,
-              // --- FIX: Pass isGroup to MessageBubble ---
-              isGroup: widget.isGroup,
-              onLongPress: _showOptions,
-              onReplyTap: _scrollToMessage,
-              onImageTap: (img) => Navigator.push(context, MaterialPageRoute(builder: (_) => FullScreenImage(base64Image: img))),
-            );
-          },
+        return MessageBubble(
+          key: _messageKeys[msg.id],
+          data: msg.data,
+          id: msg.id,
+          isMe: isMe,
+          isGroup: widget.isGroup,
+          userFuture: userFuture,
+          imageCache: imageCache,
+          userImageCache: userImageCache,
+          onLongPress: _showOptions,
+          onReplyTap: _scrollToMessage,
+          onImageTap: (img) => Navigator.push(context, MaterialPageRoute(builder: (_) => FullScreenImage(base64Image: img))),
         );
       },
     );
@@ -822,6 +900,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 }
 
+class Message {
+  final Map<String, dynamic> data;
+  final String id;
+  Message(this.data, this.id);
+}
+
 class MessageBubble extends StatefulWidget {
   final Map<String, dynamic> data;
   final String id;
@@ -829,8 +913,10 @@ class MessageBubble extends StatefulWidget {
   final Function(Map<String, dynamic>, String, bool) onLongPress;
   final Function(String) onReplyTap;
   final Function(String) onImageTap;
-  // --- FIX: Add isGroup parameter ---
   final bool isGroup;
+  final Future<DocumentSnapshot>? userFuture;
+  final Map<String, Uint8List> imageCache;
+  final Map<String, Uint8List> userImageCache;
 
   const MessageBubble({
     super.key,
@@ -841,6 +927,9 @@ class MessageBubble extends StatefulWidget {
     required this.onReplyTap,
     required this.onImageTap,
     this.isGroup = false,
+    this.userFuture,
+    required this.imageCache,
+    required this.userImageCache,
   });
 
   @override
@@ -848,16 +937,6 @@ class MessageBubble extends StatefulWidget {
 }
 
 class _MessageBubbleState extends State<MessageBubble> {
-  Uint8List? _decodedImage;
-
-  @override
-  void initState() {
-    super.initState();
-    if (widget.data['type'] == 'image' && widget.data['message'] != null) {
-      _decodedImage = base64Decode(widget.data['message']);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     String time = "";
@@ -867,7 +946,6 @@ class _MessageBubbleState extends State<MessageBubble> {
     }
     bool isPhoto = widget.data['type'] == 'image';
 
-    // --- FIX: Logic to build MessageBubble content ---
     Widget bubbleContent = Container(
       constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
       padding: const EdgeInsets.all(16),
@@ -886,9 +964,14 @@ class _MessageBubbleState extends State<MessageBubble> {
                       onTap: () => widget.onImageTap(widget.data['message']),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(12),
-                        child: _decodedImage != null 
-                            ? Image.memory(_decodedImage!, gaplessPlayback: true) 
-                            : const SizedBox(),
+                        child: Builder(
+                          builder: (context) {
+                            if (!widget.imageCache.containsKey(widget.id)) {
+                              widget.imageCache[widget.id] = base64Decode(widget.data['message']);
+                            }
+                            return Image.memory(widget.imageCache[widget.id]!, gaplessPlayback: true);
+                          },
+                        ),
                       ),
                     )
                   : Text(widget.data['message'], style: const TextStyle(color: Colors.white, fontSize: 15)),
@@ -896,27 +979,34 @@ class _MessageBubbleState extends State<MessageBubble> {
       ),
     );
 
-    // --- FIX: Wrap in Row if Group Chat and Not Me ---
     Widget messageRow;
-    if (widget.isGroup && !widget.isMe) {
+    if (widget.isGroup && !widget.isMe && widget.userFuture != null) {
       messageRow = Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          StreamBuilder<DocumentSnapshot>(
-            stream: FirebaseFirestore.instance.collection('users').doc(widget.data['senderId']).snapshots(),
+          FutureBuilder<DocumentSnapshot>(
+            future: widget.userFuture,
             builder: (context, snapshot) {
               if (!snapshot.hasData) return const SizedBox(width: 32);
               var userData = snapshot.data!.data() as Map<String, dynamic>?;
               String? pic = userData?['profilePic'];
               String name = userData?['username'] ?? "U";
               
+              Uint8List? cachedImage;
+              if (pic != null) {
+                if (!widget.userImageCache.containsKey(widget.data['senderId'])) {
+                  widget.userImageCache[widget.data['senderId']] = base64Decode(pic);
+                }
+                cachedImage = widget.userImageCache[widget.data['senderId']];
+              }
+              
               return Container(
                 margin: const EdgeInsets.only(right: 8, bottom: 4),
                 child: CircleAvatar(
                   radius: 16,
                   backgroundColor: Colors.grey.shade800,
-                  backgroundImage: pic != null ? MemoryImage(base64Decode(pic)) : null,
-                  child: pic == null ? Text(name[0].toUpperCase(), style: const TextStyle(fontSize: 12, color: Colors.white)) : null,
+                  backgroundImage: cachedImage != null ? MemoryImage(cachedImage) : null,
+                  child: cachedImage == null ? Text(name[0].toUpperCase(), style: const TextStyle(fontSize: 12, color: Colors.white)) : null,
                 ),
               );
             },
@@ -948,7 +1038,7 @@ class _MessageBubbleState extends State<MessageBubble> {
                 ),
               ),
             
-            messageRow, // Insert the conditional row here
+            messageRow,
             
             Padding(
               padding: EdgeInsets.only(top: 6, left: widget.isGroup && !widget.isMe ? 40 : 4, right: 4),
